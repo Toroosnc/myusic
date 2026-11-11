@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "myusic"
+version = "1.0.0"
+description = "Lightweight cross-distribution Linux terminal music player with a cmus-style curses TUI"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Afilin" }
+]
+maintainers = [
+    { name = "Afilin" }
+]
+keywords = ["music", "player", "terminal", "tui", "curses", "cmus", "linux", "mpv"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console :: Curses",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Players",
+]
+
+[project.scripts]
+myusic = "mymusic_player:main"
+
+[tool.setuptools]
+py-modules = ["mymusic_player"]

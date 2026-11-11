@@ -696,7 +696,8 @@ def setup_colors(stdscr):
         pass
 
 
-def main(stdscr):
+def run_tui(stdscr):
+    """Internal curses entry point used by curses.wrapper()."""
     setup_colors(stdscr)
     app = MyusicApp(stdscr)
     try:
@@ -708,7 +709,8 @@ def main(stdscr):
             pass
 
 
-if __name__ == "__main__":
+def main():
+    """Console-script entry point for `myusic`."""
     if not HAS_BACKEND:
         print("Warning: no mpv/ffplay/vlc backend found.")
         print("Install on Arch Linux: sudo pacman -S mpv")
@@ -717,8 +719,12 @@ if __name__ == "__main__":
         time.sleep(1.2)
 
     try:
-        curses.wrapper(main)
+        curses.wrapper(run_tui)
     except KeyboardInterrupt:
         pass
 
     print("Thanks for using Myusic!")
+
+
+if __name__ == "__main__":
+    main()
