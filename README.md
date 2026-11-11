@@ -163,14 +163,14 @@ Example:
 
 ```bash
 mkdir -p ~/Myusic
-cp ~/Downloads/Handwork.mp3 ~/Myusic/
+cp ~/Downloads/example.mp3 ~/Myusic/
 myusic
 ```
 
 Inside the app:
 
 ```text
-:add ~/Downloads/Handwork.mp3
+:add ~/Downloads/example.mp3
 :rescan
 :play 1
 ```
@@ -235,21 +235,6 @@ Playback is handled by an external player subprocess, not by Python-level decode
 - stopping uses `SIGTERM`, then `SIGKILL` as a fallback
 - pause/resume uses POSIX `SIGSTOP` / `SIGCONT`
 - when a track ends, `myusic` advances to the next valid track automatically
-
-## GitHub / Privacy Safety via `.gitignore`
-
-The repository `.gitignore` excludes personal and machine-specific files, including:
-
-- Python bytecode/cache: `__pycache__/`, `*.pyc`, `*.pyo`
-- virtual environments: `venv/`, `.venv/`, `env/`
-- user music folders: `~/Myusic`, `Myusic/`, `.myusic/`
-- audio files: `*.mp3`, `*.flac`, `*.ogg`, `*.wav`, `*.m4a`
-- editor/IDE metadata: `.vscode/`, `.idea/`
-- OS metadata: `.DS_Store`, `Thumbs.db`
-- swap/backup files: `*.swp`, `*.swo`, `*~`
-- packaging artifacts: `build/`, `dist/`, `*.egg-info/`, `*.whl`
-
-This helps prevent accidentally committing personal music or local environment files to GitHub. Note that `~/Myusic` lives outside the repository; keep personal music there or use a global Git ignore file if you want to guarantee it is never staged.
 
 ## Troubleshooting
 
