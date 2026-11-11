@@ -1,20 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-myusic - Pemutar Musik Terminal (CLI/TUI) ringan, cross-platform di Linux.
+myusic - Lightweight Terminal Music Player (CLI/TUI) for Linux.
 
-Fitur:
-- Deteksi otomatis folder ~/Myusic (dibuat jika belum ada)
-- Putar .mp3, .flac, .ogg, .wav, .m4a
-- Antarmuka TUI berbasis curses (mirip cmus)
-- Keybinding gaya Vim dan mode perintah ':'
-- Audio engine eksternal via subprocess: mpv (utama), ffplay, atau vlc
-- Log dari backend eksternal di-silence ke /dev/null agar TUI tidak rusak
-- Validasi file sangat longgar: cukup file ada + ekstensi didukung + non-empty
-- Tidak melakukan deep decode/header scan saat rescan; decoding sepenuhnya
-  ditangani oleh player eksternal saat lagu diputar.
+Features:
+- Automatically detects the ~/Myusic folder (creates it if missing)
+- Plays .mp3, .flac, .ogg, .wav, .m4a files located in ~/Myusic
+- Interactive curses-based TUI (similar to cmus)
+- Vim-style key bindings and a ':' command mode
+- Audio backend: external subprocess via mpv (preferred), ffplay, or vlc
+- External player stdout/stderr/stdin are sent to /dev/null so they never
+  corrupt the curses layout
+- File validation is intentionally light: exists + supported extension +
+  non-empty file. Actual decoding is left to the external player.
+- Uses curses default colors with -1 background so a transparent/translucent
+  terminal background/wallpaper remains visible.
 
-Cara instalasi cepat di Arch Linux:
+Quick install (Arch Linux):
     sudo pacman -S mpv
     chmod +x mymusic_player.py
     sudo cp mymusic_player.py /usr/local/bin/myusic
@@ -36,7 +38,7 @@ STOPPED = "STOPPED"
 PLAYING = "PLAYING"
 PAUSED = "PAUSED"
 
-# Urutan prioritas backend. mpv paling stabil untuk Linux dan semua format.
+# Backend priority: mpv is preferred, with ffplay/vlc as fallbacks.
 BACKENDS = [
     ("mpv", ["--no-video", "--really-quiet", "--force-window=no", "--loop-file=no"]),
     ("ffplay", ["-nodisp", "-autoexit", "-loglevel", "quiet"]),
@@ -59,38 +61,38 @@ HAS_BACKEND = BACKEND_PATH is not None
 
 def probe_audio_file(path):
     """
-    Validasi minimal saja. JANGAN deep-decode di sini.
+    Minimal validation only. Do NOT deep-decode here.
 
-    File dianggap kandidat valid jika:
-    - ekstensinya didukung,
-    - file benar-benar ada,
-    - berupa file regular,
-    - ukurannya > 0.
+    A file is considered a playable candidate when:
+      - its extension is supported,
+      - it exists,
+      - it is a regular file,
+      - its size is greater than zero.
 
-    mpv/ffplay/vlc yang akan menentukan apakah file benar-benar bisa decode.
+    The external player decides whether the file can actually be decoded.
     """
     try:
         p = Path(path)
         ext = p.suffix.lower()
         if ext not in SUPPORTED:
-            return False, "ekstensi tidak didukung"
+            return False, "unsupported extension"
         if not p.exists():
-            return False, "file tidak ditemukan"
+            return False, "file not found"
         if not p.is_file():
-            return False, "path bukan file"
+            return False, "not a file"
         if p.stat().st_size <= 0:
-            return False, "file kosong"
+            return False, "empty file"
         return True, "ok"
     except PermissionError:
         return False, "permission denied"
     except OSError as e:
-        return False, f"error membaca file: {e}"
+        return False, f"read error: {e}"
     except Exception as e:
-        return False, f"error validasi: {e}"
+        return False, f"validation error: {e}"
 
 
 def get_duration_seconds(path):
-    """Ambil durasi via ffprobe jika tersedia. Jika tidak, return 0.0 (tidak fatal)."""
+    """Read duration via ffprobe when available. Return 0.0 if unavailable."""
     ffprobe = shutil.which("ffprobe")
     if not ffprobe:
         return 0.0
@@ -146,7 +148,7 @@ class MyusicApp:
         self.scan()
 
         if not HAS_BACKEND:
-            self.notify("Backend audio tidak ditemukan. Install: sudo pacman -S mpv")
+            self.notify("No audio backend found. Install one with: sudo pacman -S mpv")
 
     # ------------------------------------------------------------------ #
     # Folder & scanning
@@ -155,9 +157,9 @@ class MyusicApp:
         try:
             if not MUSIC_DIR.exists():
                 MUSIC_DIR.mkdir(parents=True, exist_ok=True)
-                self.notify(f"Direktori dibuat: {MUSIC_DIR}")
+                self.notify(f"Directory created: {MUSIC_DIR}")
         except Exception as e:
-            self.notify(f"Gagal membuat direktori: {e}")
+            self.notify(f"Failed to create directory: {e}")
 
     def probe_cached(self, path):
         key = str(path)
@@ -176,7 +178,7 @@ class MyusicApp:
             )
         except Exception as e:
             self.songs = []
-            self.notify(f"Gagal memindai folder: {e}")
+            self.notify(f"Failed to scan folder: {e}")
 
         self.file_ok = {}
         self.file_reason = {}
@@ -198,11 +200,11 @@ class MyusicApp:
     # ------------------------------------------------------------------ #
     def _spawn_player(self, path):
         if not HAS_BACKEND:
-            raise RuntimeError("mpv/ffplay/vlc tidak ditemukan")
+            raise RuntimeError("mpv/ffplay/vlc not found")
 
         args = [BACKEND_PATH, *(BACKEND_ARGS or []), str(path)]
 
-        # stdout/stderr/stdin ke DEVNULL supaya tidak menimpa curses.
+        # Send stdout/stderr/stdin to DEVNULL so the player cannot draw over curses.
         return subprocess.Popen(
             args,
             stdout=subprocess.DEVNULL,
@@ -221,7 +223,7 @@ class MyusicApp:
             if proc.poll() is not None:
                 return
 
-            # Coba berhenti dengan SIGTERM dulu.
+            # Ask the player to stop first.
             try:
                 os.kill(proc.pid, signal.SIGTERM)
             except Exception:
@@ -232,9 +234,9 @@ class MyusicApp:
 
             proc.wait(timeout=0.6)
         except Exception:
-            # Kalau process masih hidup (mungkin SIGSTOP-paused / tidak responsif), paksa.
+            # If still alive (e.g. SIGSTOP-paused), wake it and force kill.
             try:
-                os.kill(proc.pid, signal.SIGCONT)  # bangun dulu jika sedang SIGSTOP
+                os.kill(proc.pid, signal.SIGCONT)
             except Exception:
                 pass
             try:
@@ -251,7 +253,7 @@ class MyusicApp:
 
     def _load_and_play(self, index):
         if not self.songs:
-            self.notify("Tidak ada lagu di ~/Myusic")
+            self.notify("No songs found in ~/Myusic")
             return False
 
         index = max(0, min(index, len(self.songs) - 1))
@@ -259,11 +261,11 @@ class MyusicApp:
 
         ok, reason = self.probe_cached(path)
         if not ok:
-            self.notify(f"Dilewati ({path.name}): {reason}")
+            self.notify(f"Skipped ({path.name}): {reason}")
             return False
 
         if not HAS_BACKEND:
-            self.notify("Backend audio tidak ditemukan. Install: sudo pacman -S mpv")
+            self.notify("No audio backend found. Install one with: sudo pacman -S mpv")
             return False
 
         self._terminate_proc()
@@ -273,7 +275,7 @@ class MyusicApp:
         except Exception as e:
             self.proc = None
             self.status = STOPPED
-            self.notify(f"Gagal memuat ({path.name}): {e}")
+            self.notify(f"Failed to load ({path.name}): {e}")
             return False
 
         self.current = index
@@ -284,7 +286,7 @@ class MyusicApp:
         self.paused_total = 0.0
         self.pos = 0.0
         self.duration = get_duration_seconds(path)
-        self.notify(f"Memutar ({BACKEND_NAME}): {path.name}")
+        self.notify(f"Playing ({BACKEND_NAME}): {path.name}")
         return True
 
     def play_index(self, index):
@@ -296,7 +298,7 @@ class MyusicApp:
     def _advance(self, direction):
         valid = self._valid_indices()
         if not valid:
-            self.notify("Tidak ada file audio valid untuk diputar.")
+            self.notify("No valid audio files to play.")
             return
 
         n = len(self.songs)
@@ -310,7 +312,7 @@ class MyusicApp:
                 self.play_index(idx)
                 return
 
-        self.notify("Tidak ada file audio valid untuk diputar.")
+        self.notify("No valid audio files to play.")
 
     def next_song(self):
         self._advance(+1)
@@ -320,7 +322,7 @@ class MyusicApp:
 
     def toggle_pause(self):
         if not HAS_BACKEND:
-            self.notify("Backend audio tidak ditemukan. Install: sudo pacman -S mpv")
+            self.notify("No audio backend found. Install one with: sudo pacman -S mpv")
             return
 
         if self.proc is None:
@@ -332,8 +334,8 @@ class MyusicApp:
 
         try:
             if self.status == PLAYING:
-                # POSIX pause/resume: SIGSTOP menghentikan proses player,
-                # SIGCONT melanjutkan kembali audio.
+                # POSIX pause/resume: SIGSTOP stops the player process,
+                # SIGCONT resumes audio playback.
                 os.kill(self.proc.pid, signal.SIGSTOP)
                 self.status = PAUSED
                 self.pause_time = time.time()
@@ -346,7 +348,7 @@ class MyusicApp:
             else:
                 self.play_index(self.selected if self.selected >= 0 else 0)
         except Exception as e:
-            self.notify(f"Pause/Resume gagal: {e}")
+            self.notify(f"Pause/Resume failed: {e}")
 
     def stop(self):
         self._terminate_proc()
@@ -359,36 +361,36 @@ class MyusicApp:
     def add_file(self, src_str):
         src = Path(src_str).expanduser()
         if not src.exists():
-            self.notify(f"File tidak ditemukan: {src}")
+            self.notify(f"File not found: {src}")
             return
         if not src.is_file():
-            self.notify("Path bukan file.")
+            self.notify("Path is not a file.")
             return
         if src.suffix.lower() not in SUPPORTED:
-            self.notify("Format file tidak didukung.")
+            self.notify("Unsupported file format.")
             return
         if src.stat().st_size == 0:
-            self.notify("File kosong, tidak ditambahkan.")
+            self.notify("Empty file, not added.")
             return
 
         dest = MUSIC_DIR / src.name
         if dest.exists():
-            self.notify(f"Sudah ada: {src.name}")
+            self.notify(f"Already exists: {src.name}")
             return
 
         try:
             shutil.copy2(src, dest)
             self.scan()
-            self.notify(f"Ditambahkan: {src.name}")
+            self.notify(f"Added: {src.name}")
         except Exception as e:
-            self.notify(f"Gagal menyalin: {e}")
+            self.notify(f"Failed to copy file: {e}")
 
     # ------------------------------------------------------------------ #
     # UI helpers
     # ------------------------------------------------------------------ #
     def update(self):
         if self.status == PLAYING:
-            # Deteksi lagu selesai secara natural.
+            # Detect when the player exits naturally at the end of the track.
             if self.proc is not None and self.proc.poll() is not None:
                 self.proc = None
                 self.next_song()
@@ -434,22 +436,22 @@ class MyusicApp:
         elif cmd in ("rescan", "r"):
             self.scan()
             ok_count = sum(1 for p in self.songs if self.probe_cached(p)[0])
-            self.notify(f"Direscan. {len(self.songs)} file, {ok_count} valid.")
+            self.notify(f"Rescanned. {len(self.songs)} files, {ok_count} valid.")
         elif cmd == "play":
             if not args:
-                self.notify("Penggunaan: :play <nomor>")
+                self.notify("Usage: :play <number>")
                 return
             try:
                 self.play_index(int(args[0]) - 1)
             except ValueError:
-                self.notify("Nomor lagu tidak valid.")
+                self.notify("Invalid song number.")
         elif cmd == "add":
             if not args:
-                self.notify("Penggunaan: :add <path>")
+                self.notify("Usage: :add <path>")
                 return
             self.add_file(args[0])
         else:
-            self.notify(f"Perintah tidak dikenal: :{cmd}")
+            self.notify(f"Unknown command: :{cmd}")
 
     # ------------------------------------------------------------------ #
     # Drawing
@@ -468,44 +470,49 @@ class MyusicApp:
                 pass
             return
 
-        header = " Myusic - Pemutar Musik Terminal "
-        self._safe_addstr(0, 0, header.ljust(w), w, curses.A_BOLD | curses.A_REVERSE)
+        normal_attr = curses.color_pair(1) if curses.has_colors() else 0
+        accent_attr = curses.color_pair(2) if curses.has_colors() else curses.A_BOLD
+        selected_attr = curses.color_pair(3) | curses.A_BOLD if curses.has_colors() else curses.A_REVERSE
 
-        backend = BACKEND_NAME or "tidak ada"
+        header = " Myusic - Terminal Music Player "
+        self._safe_addstr(0, 0, header.ljust(w), w, accent_attr | curses.A_BOLD)
+
+        backend = BACKEND_NAME or "none"
         valid = sum(1 for p in self.songs if self.probe_cached(p)[0])
-        info = f"Folder: {MUSIC_DIR}  |  Lagu: {len(self.songs)}  |  Valid: {valid}  |  Backend: {backend}"
-        self._safe_addstr(1, 0, info, w)
+        info = f"Folder: {MUSIC_DIR}  |  Songs: {len(self.songs)}  |  Valid: {valid}  |  Backend: {backend}"
+        self._safe_addstr(1, 0, info, w, normal_attr)
 
         if self.show_help_screen:
-            self.draw_help(h, w)
+            self.draw_help(h, w, normal_attr, accent_attr)
         else:
-            self.draw_list(h, w)
+            self.draw_list(h, w, normal_attr, selected_attr)
 
         status_y = h - 3
         status = f"[{self.status}] "
         if 0 <= self.current < len(self.songs):
             status += f"{self.current + 1}. {self.songs[self.current].name}  |  "
         status += f"{self.fmt_time(self.pos)} / {self.fmt_time(self.duration)}"
-        self._safe_addstr(status_y, 0, status, w, curses.A_BOLD)
+        self._safe_addstr(status_y, 0, status, w, accent_attr | curses.A_BOLD)
 
-        # Hints
+        # Hints or transient status message.
         if self.msg and time.time() - self.msg_time < 6:
-            self._safe_addstr(h - 2, 0, self.msg, w, curses.A_BOLD)
+            self._safe_addstr(h - 2, 0, self.msg, w, accent_attr | curses.A_BOLD)
         else:
             self._safe_addstr(
                 h - 2,
                 0,
-                "j/k=Nav | Enter=Putar | Spasi/c=Pause | v=Stop | b=Next | z=Prev | :=Cmd | q=Keluar",
+                "j/k=Navigate | Enter=Play | Space/c=Pause | v=Stop | b=Next | z=Prev | :=Command | q=Quit",
                 w,
+                normal_attr,
             )
 
         try:
             if self.cmd_mode:
-                self.stdscr.addnstr(h - 1, 0, ":" + self.cmd, w - 1)
+                self.stdscr.addnstr(h - 1, 0, ":" + self.cmd, w - 1, normal_attr)
                 self.stdscr.clrtoeol()
                 self.stdscr.move(h - 1, min(len(self.cmd) + 1, w - 1))
             else:
-                self.stdscr.addnstr(h - 1, 0, ">", w - 1)
+                self.stdscr.addnstr(h - 1, 0, ">", w - 1, normal_attr)
                 self.stdscr.clrtoeol()
         except curses.error:
             pass
@@ -516,7 +523,7 @@ class MyusicApp:
         except curses.error:
             pass
 
-    def draw_list(self, h, w):
+    def draw_list(self, h, w, normal_attr, selected_attr):
         start_y = 3
         end_y = h - 4
         list_h = max(1, end_y - start_y)
@@ -536,8 +543,9 @@ class MyusicApp:
             self._safe_addstr(
                 start_y,
                 0,
-                "(Folder kosong. Gunakan :add <path> untuk menambahkan lagu)",
+                "(Folder is empty. Use :add <path> to add music files)",
                 w,
+                normal_attr,
             )
             return
 
@@ -549,35 +557,35 @@ class MyusicApp:
             song = self.songs[i]
             ok, _ = self.probe_cached(song)
             play_marker = "> " if i == self.current else "  "
-            suffix = "" if ok else " [tidak valid]"
+            suffix = "" if ok else " [invalid]"
             line = f"{i + 1:>3}. {play_marker}{song.name}{suffix}"
 
-            attr = curses.A_REVERSE if i == self.selected else 0
+            attr = selected_attr if i == self.selected else normal_attr
             self._safe_addstr(y, 0, line, w, attr)
 
-    def draw_help(self, h, w):
+    def draw_help(self, h, w, normal_attr, accent_attr):
         help_text = [
             "",
-            " PERINTAH (Command Mode, awali dengan ':')",
-            "  :add <path>    Salin file musik ke ~/Myusic",
-            "  :play <nomor>  Putar lagu berdasarkan nomor urut",
-            "  :rescan / :r   Indeks ulang folder ~/Myusic",
-            "  :help          Tampilkan bantuan ini",
-            "  :quit / :q     Keluar dari Myusic",
+            " COMMANDS (Command Mode, prefix with ':')",
+            "  :add <path>    Copy a music file into ~/Myusic",
+            "  :play <number> Play a song by its list number",
+            "  :rescan / :r   Rescan the ~/Myusic folder",
+            "  :help          Show this help screen",
+            "  :quit / :q     Quit Myusic",
             "",
-            " TOMBOL (Keybinding Mode)",
-            "  j / Panah Bawah     Kursor ke bawah",
-            "  k / Panah Atas      Kursor ke atas",
-            "  Enter               Putar lagu terpilih",
-            "  Spasi / c           Pause / Resume (SIGSTOP/SIGCONT)",
-            "  v                   Stop (kill backend player)",
-            "  b                   Lagu berikutnya",
-            "  z                   Lagu sebelumnya",
-            "  r                   Rescan cepat",
-            "  q                   Keluar",
+            " KEY BINDINGS (Normal Mode)",
+            "  j / Down Arrow   Move cursor down",
+            "  k / Up Arrow     Move cursor up",
+            "  Enter            Play selected song",
+            "  Space / c        Pause / resume (SIGSTOP/SIGCONT)",
+            "  v                Stop (kill backend player)",
+            "  b                Next song",
+            "  z                Previous song",
+            "  r                Quick rescan",
+            "  q                Quit",
             "",
-            f" Backend aktif: {BACKEND_NAME or 'tidak ada'}",
-            " Tekan sembarang tombol untuk kembali...",
+            f" Active backend: {BACKEND_NAME or 'none'}",
+            " Press any key to return...",
         ]
 
         start_y = max(3, (h - len(help_text)) // 2)
@@ -585,8 +593,8 @@ class MyusicApp:
             y = start_y + i
             if 0 <= y < h - 3:
                 x = max(0, (w - len(line)) // 2)
-                bold = curses.A_BOLD if line.startswith(" PERINTAH") or line.startswith(" TOMBOL") else 0
-                self._safe_addstr(y, x, line, w, bold)
+                bold = curses.A_BOLD if line.startswith(" COMMANDS") or line.startswith(" KEY BINDINGS") else 0
+                self._safe_addstr(y, x, line, w, accent_attr | bold if bold else normal_attr)
 
     # ------------------------------------------------------------------ #
     # Main loop
@@ -655,12 +663,41 @@ class MyusicApp:
             elif ch == ord("r"):
                 self.scan()
                 ok_count = sum(1 for p in self.songs if self.probe_cached(p)[0])
-                self.notify(f"Direscan. {len(self.songs)} file, {ok_count} valid.")
+                self.notify(f"Rescanned. {len(self.songs)} files, {ok_count} valid.")
             elif ch == ord("h"):
                 self.show_help_screen = True
 
 
+def setup_colors(stdscr):
+    """Configure curses for a transparent/default terminal background."""
+    if not curses.has_colors():
+        return
+
+    curses.start_color()
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        # Some terminals do not support default colors; fall back gracefully.
+        pass
+
+    # -1 means "terminal default background" for every color pair.
+    try:
+        curses.init_pair(1, curses.COLOR_WHITE, -1)
+        curses.init_pair(2, curses.COLOR_CYAN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_GREEN, -1)
+    except curses.error:
+        pass
+
+    try:
+        # Paint the window with the default background pair, not an opaque color.
+        stdscr.bkgd(" ", curses.color_pair(1))
+    except curses.error:
+        pass
+
+
 def main(stdscr):
+    setup_colors(stdscr)
     app = MyusicApp(stdscr)
     try:
         app.run()
@@ -673,17 +710,15 @@ def main(stdscr):
 
 if __name__ == "__main__":
     if not HAS_BACKEND:
-        print("Peringatan: tidak menemukan mpv/ffplay/vlc.")
-        print("Install di Arch: sudo pacman -S mpv")
-        print("Ubuntu/Debian  : sudo apt install mpv")
-        print("Fedora         : sudo dnf install mpv")
+        print("Warning: no mpv/ffplay/vlc backend found.")
+        print("Install on Arch Linux: sudo pacman -S mpv")
+        print("Ubuntu/Debian         : sudo apt install mpv")
+        print("Fedora                : sudo dnf install mpv")
         time.sleep(1.2)
 
     try:
         curses.wrapper(main)
     except KeyboardInterrupt:
         pass
-    finally:
-        pass
 
-    print("Terima kasih telah menggunakan Myusic!")
+    print("Thanks for using Myusic!")
