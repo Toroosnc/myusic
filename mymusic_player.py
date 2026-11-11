@@ -25,6 +25,7 @@ Quick install (Arch Linux):
 import os
 import sys
 import time
+import math
 import shutil
 import signal
 import curses
@@ -38,6 +39,8 @@ STOPPED = "STOPPED"
 PLAYING = "PLAYING"
 PAUSED = "PAUSED"
 
+SPECTRUM_CHARS = ["▂", "▃", "▄", "▅", "▆", "▇", "█"]
+
 # Backend priority: mpv is preferred, with ffplay/vlc as fallbacks.
 BACKENDS = [
     ("mpv", ["--no-video", "--really-quiet", "--force-window=no", "--loop-file=no"]),
@@ -46,7 +49,6 @@ BACKENDS = [
 ]
 BACKEND_NAME, BACKEND_ARGS, BACKEND_PATH = None, None, None
 
-
 def find_backend():
     for name, args in BACKENDS:
         path = shutil.which(name)
@@ -54,10 +56,8 @@ def find_backend():
             return name, args, path
     return None, None, None
 
-
 BACKEND_NAME, BACKEND_ARGS, BACKEND_PATH = find_backend()
 HAS_BACKEND = BACKEND_PATH is not None
-
 
 def probe_audio_file(path):
     """
@@ -90,7 +90,6 @@ def probe_audio_file(path):
     except Exception as e:
         return False, f"validation error: {e}"
 
-
 def get_duration_seconds(path):
     """Read duration via ffprobe when available. Return 0.0 if unavailable."""
     ffprobe = shutil.which("ffprobe")
@@ -115,7 +114,6 @@ def get_duration_seconds(path):
         return max(0.0, float(value)) if value else 0.0
     except Exception:
         return 0.0
-
 
 class MyusicApp:
     def __init__(self, stdscr):
@@ -143,6 +141,7 @@ class MyusicApp:
         self.msg_time = 0.0
         self.show_help_screen = False
         self.running = True
+        self.spectrum = []
 
         self.ensure_dir()
         self.scan()
@@ -150,9 +149,6 @@ class MyusicApp:
         if not HAS_BACKEND:
             self.notify("No audio backend found. Install one with: sudo pacman -S mpv")
 
-    # ------------------------------------------------------------------ #
-    # Folder & scanning
-    # ------------------------------------------------------------------ #
     def ensure_dir(self):
         try:
             if not MUSIC_DIR.exists():
@@ -195,9 +191,6 @@ class MyusicApp:
         self.msg = text
         self.msg_time = time.time()
 
-    # ------------------------------------------------------------------ #
-    # Backend process control
-    # ------------------------------------------------------------------ #
     def _spawn_player(self, path):
         if not HAS_BACKEND:
             raise RuntimeError("mpv/ffplay/vlc not found")
@@ -385,9 +378,6 @@ class MyusicApp:
         except Exception as e:
             self.notify(f"Failed to copy file: {e}")
 
-    # ------------------------------------------------------------------ #
-    # UI helpers
-    # ------------------------------------------------------------------ #
     def update(self):
         if self.status == PLAYING:
             # Detect when the player exits naturally at the end of the track.
@@ -397,6 +387,40 @@ class MyusicApp:
                 return
             if self.start_time > 0:
                 self.pos = time.time() - self.start_time - self.paused_total
+        else:
+            # PAUSED/STOPPED: keep the visualizer flat.
+            if self.spectrum:
+                self.spectrum = [0.0] * len(self.spectrum)
+
+    def _ensure_spectrum(self, width):
+        width = max(0, width)
+        if len(self.spectrum) != width:
+            if width > len(self.spectrum):
+                self.spectrum.extend([0.0] * (width - len(self.spectrum)))
+            else:
+                self.spectrum = self.spectrum[:width]
+
+    def _spectrum_target(self, width):
+        target = []
+        t = self.pos if self.pos > 0 else time.time()
+        for x in range(width):
+            wave = 0.36
+            wave += 0.28 * math.sin(x * 0.32 + t * 2.2)
+            wave += 0.22 * math.sin(x * 0.11 - t * 1.35)
+            wave += 0.14 * math.sin(x * 0.73 + t * 3.4)
+            wave += 0.08 * math.sin(x * 1.9 - t * 5.1)
+            wave *= 0.65 + 0.35 * math.sin(t * 0.7 + 0.5)
+            target.append(max(0.0, min(1.0, pow(wave, 1.55))))
+        return target
+
+    def _update_spectrum(self, width):
+        self._ensure_spectrum(width)
+        if self.status != PLAYING:
+            self.spectrum = [0.0] * width
+            return
+
+        target = self._spectrum_target(width)
+        self.spectrum = [old + (new - old) * 0.48 for old, new in zip(self.spectrum, target)]
 
     @staticmethod
     def fmt_time(seconds):
@@ -417,9 +441,6 @@ class MyusicApp:
         except curses.error:
             pass
 
-    # ------------------------------------------------------------------ #
-    # Commands
-    # ------------------------------------------------------------------ #
     def run_command(self, text):
         text = text.strip()
         if not text:
@@ -453,9 +474,6 @@ class MyusicApp:
         else:
             self.notify(f"Unknown command: :{cmd}")
 
-    # ------------------------------------------------------------------ #
-    # Drawing
-    # ------------------------------------------------------------------ #
     def draw(self):
         try:
             self.stdscr.erase()
@@ -482,10 +500,20 @@ class MyusicApp:
         info = f"Folder: {MUSIC_DIR}  |  Songs: {len(self.songs)}  |  Valid: {valid}  |  Backend: {backend}"
         self._safe_addstr(1, 0, info, w, normal_attr)
 
+        if h >= 16:
+            viz_h = 6
+        elif h >= 12:
+            viz_h = 4
+        else:
+            viz_h = 0
+        viz_y = h - 3 - viz_h
+
         if self.show_help_screen:
             self.draw_help(h, w, normal_attr, accent_attr)
         else:
-            self.draw_list(h, w, normal_attr, selected_attr)
+            self.draw_list(viz_y, w, start_y=3, normal_attr=normal_attr, selected_attr=selected_attr)
+            if viz_h:
+                self.draw_visualizer(viz_y, viz_h, w, normal_attr, accent_attr)
 
         status_y = h - 3
         status = f"[{self.status}] "
@@ -523,9 +551,9 @@ class MyusicApp:
         except curses.error:
             pass
 
-    def draw_list(self, h, w, normal_attr, selected_attr):
-        start_y = 3
-        end_y = h - 4
+    def draw_list(self, bottom_y, w, start_y=3, normal_attr=0, selected_attr=0):
+        start_y = max(0, start_y)
+        end_y = max(start_y, bottom_y)
         list_h = max(1, end_y - start_y)
 
         if self.songs:
@@ -551,7 +579,7 @@ class MyusicApp:
 
         for i in range(self.scroll_offset, min(self.scroll_offset + list_h, len(self.songs))):
             y = start_y + (i - self.scroll_offset)
-            if y >= h - 3:
+            if y >= end_y:
                 break
 
             song = self.songs[i]
@@ -562,6 +590,33 @@ class MyusicApp:
 
             attr = selected_attr if i == self.selected else normal_attr
             self._safe_addstr(y, 0, line, w, attr)
+
+    def draw_visualizer(self, y_start, height, w, normal_attr, accent_attr):
+        if height <= 0 or w <= 0:
+            return
+
+        self._update_spectrum(w)
+        bars_attr = curses.color_pair(4) if curses.has_colors() else accent_attr
+
+        for row in range(height):
+            y = y_start + row
+            row_from_bottom = y_start + height - 1 - y
+            line = []
+
+            for x in range(w):
+                level = self.spectrum[x]
+                bar_height = int(level * height)
+                if level > 0 and bar_height == 0:
+                    bar_height = 1
+
+                if row_from_bottom < bar_height:
+                    ratio = (row_from_bottom + 1) / max(bar_height, 1)
+                    char_index = min(len(SPECTRUM_CHARS) - 1, int(ratio * (len(SPECTRUM_CHARS) - 1)))
+                    line.append(SPECTRUM_CHARS[char_index])
+                else:
+                    line.append(" ")
+
+            self._safe_addstr(y, 0, "".join(line), w, bars_attr if any(c != " " for c in line) else normal_attr)
 
     def draw_help(self, h, w, normal_attr, accent_attr):
         help_text = [
@@ -596,9 +651,6 @@ class MyusicApp:
                 bold = curses.A_BOLD if line.startswith(" COMMANDS") or line.startswith(" KEY BINDINGS") else 0
                 self._safe_addstr(y, x, line, w, accent_attr | bold if bold else normal_attr)
 
-    # ------------------------------------------------------------------ #
-    # Main loop
-    # ------------------------------------------------------------------ #
     def run(self):
         try:
             curses.curs_set(0)
@@ -667,7 +719,6 @@ class MyusicApp:
             elif ch == ord("h"):
                 self.show_help_screen = True
 
-
 def setup_colors(stdscr):
     """Configure curses for a transparent/default terminal background."""
     if not curses.has_colors():
@@ -695,7 +746,6 @@ def setup_colors(stdscr):
     except curses.error:
         pass
 
-
 def run_tui(stdscr):
     """Internal curses entry point used by curses.wrapper()."""
     setup_colors(stdscr)
@@ -707,7 +757,6 @@ def run_tui(stdscr):
             app.stop()
         except Exception:
             pass
-
 
 def main():
     """Console-script entry point for `myusic`."""
@@ -724,7 +773,6 @@ def main():
         pass
 
     print("Thanks for using Myusic!")
-
 
 if __name__ == "__main__":
     main()
