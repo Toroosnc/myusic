@@ -1,24 +1,18 @@
-# ------------------------------------------------------------
 # Python bytecode and cache
-# ------------------------------------------------------------
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
 
-# ------------------------------------------------------------
 # Virtual environments
-# ------------------------------------------------------------
 venv/
 .venv/
 env/
 ENV/
 
-# ------------------------------------------------------------
 # User music and audio files
 # Keeps personal/local audio out of GitHub for privacy/copyright safety.
 # NOTE: ~/Myusic is outside this repository; keep personal music there.
-# ------------------------------------------------------------
 ~/Myusic
 Myusic/
 .myusic/
@@ -28,9 +22,7 @@ Myusic/
 *.wav
 *.m4a
 
-# ------------------------------------------------------------
 # IDE / editor / OS metadata
-# ------------------------------------------------------------
 .vscode/
 .idea/
 .DS_Store
@@ -39,9 +31,7 @@ Thumbs.db
 *.swo
 *~
 
-# ------------------------------------------------------------
 # Packaging/build artifacts
-# ------------------------------------------------------------
 build/
 dist/
 *.egg-info/
