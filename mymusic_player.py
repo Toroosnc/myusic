@@ -26,10 +26,16 @@ import os
 import sys
 import time
 import math
+import json
+import random
 import shutil
 import signal
+import socket
 import curses
 import subprocess
+import tempfile
+import threading
+from array import array
 from pathlib import Path
 
 MUSIC_DIR = Path.home() / "Myusic"
@@ -40,6 +46,8 @@ PLAYING = "PLAYING"
 PAUSED = "PAUSED"
 
 SPECTRUM_CHARS = ["▂", "▃", "▄", "▅", "▆", "▇", "█"]
+ANALYSIS_RATE = 4000
+ANALYSIS_WINDOW = 0.1
 
 # Backend priority: mpv is preferred, with ffplay/vlc as fallbacks.
 BACKENDS = [
@@ -142,6 +150,13 @@ class MyusicApp:
         self.show_help_screen = False
         self.running = True
         self.spectrum = []
+        self.viz_freq = []
+        self.viz_phase = []
+        self.viz_amp = []
+        self.audio_envelope = []
+        self.analysis_done = False
+        self.analysis_failed = False
+        self.ipc_path = None
 
         self.ensure_dir()
         self.scan()
@@ -195,7 +210,21 @@ class MyusicApp:
         if not HAS_BACKEND:
             raise RuntimeError("mpv/ffplay/vlc not found")
 
-        args = [BACKEND_PATH, *(BACKEND_ARGS or []), str(path)]
+        args = [BACKEND_PATH, *(BACKEND_ARGS or [])]
+        self.ipc_path = None
+
+        if BACKEND_NAME == "mpv":
+            # JSON IPC socket lets the UI query playback-time/audio properties in real time.
+            self.ipc_path = tempfile.mktemp(prefix="myusic-mpv-", suffix=".sock")
+            try:
+                if os.path.exists(self.ipc_path):
+                    os.remove(self.ipc_path)
+            except OSError:
+                self.ipc_path = None
+            if self.ipc_path:
+                args.append(f"--input-ipc-server={self.ipc_path}")
+
+        args.append(str(path))
 
         # Send stdout/stderr/stdin to DEVNULL so the player cannot draw over curses.
         return subprocess.Popen(
@@ -209,6 +238,7 @@ class MyusicApp:
     def _terminate_proc(self):
         proc = self.proc
         self.proc = None
+        self._cleanup_ipc_path()
         if proc is None:
             return
 
@@ -244,6 +274,122 @@ class MyusicApp:
             except Exception:
                 pass
 
+    def _cleanup_ipc_path(self):
+        path = self.ipc_path
+        self.ipc_path = None
+        if not path:
+            return
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+
+    def _reset_audio_analysis(self):
+        self.audio_envelope = []
+        self.analysis_done = False
+        self.analysis_failed = False
+
+    def _analyze_audio(self, path):
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.analysis_failed = True
+            return
+
+        try:
+            proc = subprocess.run(
+                [ffmpeg, "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(ANALYSIS_RATE), "-f", "f32le", "-"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                stdin=subprocess.DEVNULL,
+                timeout=30,
+            )
+            raw = proc.stdout or b""
+            usable = len(raw) - (len(raw) % 4)
+            if usable <= 0:
+                self.analysis_failed = True
+                return
+            samples = array("f", raw[:usable])
+            window = max(1, int(ANALYSIS_RATE * ANALYSIS_WINDOW))
+            envelope = []
+            for i in range(0, len(samples), window):
+                chunk = samples[i:i + window]
+                if not chunk:
+                    continue
+                energy = sum(sample * sample for sample in chunk) / len(chunk)
+                envelope.append(math.sqrt(energy))
+            peak = max(envelope) if envelope else 0.0
+            if peak > 0:
+                envelope = [min(1.0, (value / peak) * 1.35) for value in envelope]
+            self.audio_envelope = envelope
+            self.analysis_done = True
+        except Exception:
+            self.analysis_failed = True
+
+    def _mpv_get_property(self, prop):
+        if BACKEND_NAME != "mpv" or not self.ipc_path:
+            return None
+
+        try:
+            if not os.path.exists(self.ipc_path):
+                return None
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.25)
+            sock.connect(self.ipc_path)
+            sock.sendall(json.dumps({"command": ["get_property", prop]}).encode() + b"\n")
+
+            chunks = []
+            deadline = time.time() + 0.25
+            while time.time() < deadline:
+                try:
+                    chunk = sock.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                if b"\n" in chunk:
+                    break
+
+            sock.close()
+            data = b"".join(chunks).decode("utf-8", errors="ignore")
+            for line in data.splitlines():
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if message.get("error") == "success":
+                    return message.get("data")
+            return None
+        except Exception:
+            return None
+
+    def _playback_time(self):
+        mpv_time = self._mpv_get_property("playback-time")
+        if not isinstance(mpv_time, (int, float)):
+            mpv_time = self._mpv_get_property("time-pos")
+        if isinstance(mpv_time, (int, float)):
+            return max(0.0, float(mpv_time))
+        if self.start_time > 0:
+            return max(0.0, time.time() - self.start_time - self.paused_total)
+        return self.pos
+
+    def _envelope_at(self, seconds):
+        if self.audio_envelope:
+            position = max(0.0, seconds) / ANALYSIS_WINDOW
+            index = int(position)
+            frac = position - index
+            index = max(0, min(index, len(self.audio_envelope) - 1))
+            next_index = min(index + 1, len(self.audio_envelope) - 1)
+            return self.audio_envelope[index] * (1.0 - frac) + self.audio_envelope[next_index] * frac
+
+        t = max(0.0, seconds)
+        wave = 0.32
+        wave += 0.22 * (0.5 + 0.5 * math.sin(t * 1.7))
+        wave += 0.18 * (0.5 + 0.5 * math.sin(t * 3.9 + 1.2))
+        wave += 0.12 * (0.5 + 0.5 * math.sin(t * 6.7 + 2.4))
+        return max(0.05, min(0.82, wave))
+
     def _load_and_play(self, index):
         if not self.songs:
             self.notify("No songs found in ~/Myusic")
@@ -262,6 +408,7 @@ class MyusicApp:
             return False
 
         self._terminate_proc()
+        self._reset_audio_analysis()
 
         try:
             self.proc = self._spawn_player(path)
@@ -279,6 +426,7 @@ class MyusicApp:
         self.paused_total = 0.0
         self.pos = 0.0
         self.duration = get_duration_seconds(path)
+        threading.Thread(target=self._analyze_audio, args=(path,), daemon=True).start()
         self.notify(f"Playing ({BACKEND_NAME}): {path.name}")
         return True
 
@@ -350,6 +498,7 @@ class MyusicApp:
         self.start_time = 0.0
         self.pause_time = 0.0
         self.paused_total = 0.0
+        self._reset_audio_analysis()
 
     def add_file(self, src_str):
         src = Path(src_str).expanduser()
@@ -385,8 +534,9 @@ class MyusicApp:
                 self.proc = None
                 self.next_song()
                 return
-            if self.start_time > 0:
-                self.pos = time.time() - self.start_time - self.paused_total
+            self.pos = self._playback_time()
+            if self.duration <= 0 and self.audio_envelope:
+                self.duration = len(self.audio_envelope) * ANALYSIS_WINDOW
         else:
             # PAUSED/STOPPED: keep the visualizer flat.
             if self.spectrum:
@@ -395,22 +545,39 @@ class MyusicApp:
     def _ensure_spectrum(self, width):
         width = max(0, width)
         if len(self.spectrum) != width:
-            if width > len(self.spectrum):
-                self.spectrum.extend([0.0] * (width - len(self.spectrum)))
-            else:
-                self.spectrum = self.spectrum[:width]
+            self.spectrum = [0.0] * width
+            self.viz_freq = [random.uniform(1.6, 4.8) for _ in range(width)]
+            self.viz_phase = [random.uniform(0.0, math.tau) for _ in range(width)]
+            self.viz_amp = [random.uniform(0.55, 1.0) for _ in range(width)]
 
     def _spectrum_target(self, width):
         target = []
-        t = self.pos if self.pos > 0 else time.time()
+        wall_time = time.time()
+        t = wall_time * 2.35 + self.pos * 2.05
+        envelope = self._envelope_at(self.pos)
+        intensity = max(0.0, min(1.0, (envelope - 0.12) / 0.72))
+        beat = 0.5 + 0.5 * math.sin(t * 6.4)
+        slow_band = 0.5 + 0.5 * math.sin(t * 0.47 + 1.1)
+
         for x in range(width):
-            wave = 0.36
-            wave += 0.28 * math.sin(x * 0.32 + t * 2.2)
-            wave += 0.22 * math.sin(x * 0.11 - t * 1.35)
-            wave += 0.14 * math.sin(x * 0.73 + t * 3.4)
-            wave += 0.08 * math.sin(x * 1.9 - t * 5.1)
-            wave *= 0.65 + 0.35 * math.sin(t * 0.7 + 0.5)
-            target.append(max(0.0, min(1.0, pow(wave, 1.55))))
+            freq = self.viz_freq[x]
+            phase = self.viz_phase[x]
+            amp = self.viz_amp[x]
+
+            body = 0.50 + 0.50 * math.sin(t * freq + phase + 0.62 * math.sin(t * 1.1 + x * 0.022))
+            harmonic = 0.50 + 0.50 * math.sin(t * freq * 1.91 + phase * 1.43 + x * 0.052)
+            flutter = 0.50 + 0.50 * math.sin(wall_time * 11.5 + phase * 2.7 + x * 0.061)
+
+            reaction = envelope * (
+                0.64 * amp * (0.38 + 0.62 * body)
+                + 0.36 * harmonic
+                + 0.20 * flutter
+            )
+            reaction *= 0.48 + 1.35 * intensity * beat
+            reaction *= 0.68 + 0.36 * slow_band
+            wave = 0.018 + reaction
+            wave = max(0.0, min(1.0, wave))
+            target.append(math.pow(wave, 1.08))
         return target
 
     def _update_spectrum(self, width):
@@ -420,7 +587,7 @@ class MyusicApp:
             return
 
         target = self._spectrum_target(width)
-        self.spectrum = [old + (new - old) * 0.48 for old, new in zip(self.spectrum, target)]
+        self.spectrum = [old + (new - old) * 0.74 for old, new in zip(self.spectrum, target)]
 
     @staticmethod
     def fmt_time(seconds):
@@ -591,32 +758,45 @@ class MyusicApp:
             attr = selected_attr if i == self.selected else normal_attr
             self._safe_addstr(y, 0, line, w, attr)
 
+    def _visualizer_attr(self, step, accent_attr):
+        if not curses.has_colors():
+            return accent_attr | curses.A_BOLD
+        if step < 0.40:
+            return curses.color_pair(4) | curses.A_BOLD
+        if step < 0.68:
+            return curses.color_pair(3) | curses.A_BOLD
+        if step < 0.86:
+            return curses.color_pair(5) | curses.A_BOLD
+        return curses.color_pair(6) | curses.A_BOLD
+
+    def _safe_putc(self, y, x, text, attr):
+        try:
+            self.stdscr.addnstr(y, x, text, len(text), attr)
+        except curses.error:
+            pass
+
     def draw_visualizer(self, y_start, height, w, normal_attr, accent_attr):
         if height <= 0 or w <= 0:
             return
 
         self._update_spectrum(w)
-        bars_attr = curses.color_pair(4) if curses.has_colors() else accent_attr
 
         for row in range(height):
             y = y_start + row
-            row_from_bottom = y_start + height - 1 - y
-            line = []
+            row_from_bottom = height - 1 - row
+            step = (row_from_bottom + 1) / max(1, height)
+            self._safe_addstr(y, 0, " " * w, w, normal_attr)
 
             for x in range(w):
                 level = self.spectrum[x]
-                bar_height = int(level * height)
-                if level > 0 and bar_height == 0:
-                    bar_height = 1
+                if level <= 0.0:
+                    continue
 
+                bar_height = math.ceil(level * height)
                 if row_from_bottom < bar_height:
-                    ratio = (row_from_bottom + 1) / max(bar_height, 1)
+                    ratio = (row_from_bottom + 1) / max(1, bar_height)
                     char_index = min(len(SPECTRUM_CHARS) - 1, int(ratio * (len(SPECTRUM_CHARS) - 1)))
-                    line.append(SPECTRUM_CHARS[char_index])
-                else:
-                    line.append(" ")
-
-            self._safe_addstr(y, 0, "".join(line), w, bars_attr if any(c != " " for c in line) else normal_attr)
+                    self._safe_putc(y, x, SPECTRUM_CHARS[char_index], self._visualizer_attr(step, accent_attr))
 
     def draw_help(self, h, w, normal_attr, accent_attr):
         help_text = [
@@ -657,7 +837,7 @@ class MyusicApp:
         except Exception:
             pass
 
-        self.stdscr.timeout(100)
+        self.stdscr.timeout(33)
 
         while self.running:
             self.update()
@@ -737,6 +917,8 @@ def setup_colors(stdscr):
         curses.init_pair(2, curses.COLOR_CYAN, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
         curses.init_pair(4, curses.COLOR_GREEN, -1)
+        curses.init_pair(5, curses.COLOR_RED, -1)
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
     except curses.error:
         pass
 
